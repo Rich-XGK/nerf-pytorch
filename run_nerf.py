@@ -37,8 +37,8 @@ def batchify(fn, chunk):
 def run_network(inputs, viewdirs, fn, embed_fn, embeddirs_fn, netchunk=1024*64):
     """Prepares inputs and applies network 'fn'.
     """
-    inputs_flat = torch.reshape(inputs, [-1, inputs.shape[-1]])
-    embedded = embed_fn(inputs_flat)
+    inputs_flat = torch.reshape(inputs, [-1, inputs.shape[-1]]) # [N_rays * N_samples, 3]
+    embedded = embed_fn(inputs_flat)    # [N_rays * N_samples, 63] 
 
     if viewdirs is not None:
         input_dirs = viewdirs[:,None].expand(inputs.shape)
@@ -117,8 +117,8 @@ def render(H, W, K, chunk=1024*32, rays=None, c2w=None, ndc=True,
     rays_o = torch.reshape(rays_o, [-1,3]).float()
     rays_d = torch.reshape(rays_d, [-1,3]).float()
 
-    near, far = near * torch.ones_like(rays_d[...,:1]), far * torch.ones_like(rays_d[...,:1])
-    rays = torch.cat([rays_o, rays_d, near, far], -1)
+    near, far = near * torch.ones_like(rays_d[...,:1]), far * torch.ones_like(rays_d[...,:1])   # [N_rand, 1]
+    rays = torch.cat([rays_o, rays_d, near, far], -1)   # [N_rand, 8] || last dim: 3+3+1+1
     if use_viewdirs:
         rays = torch.cat([rays, viewdirs], -1)
 
@@ -350,24 +350,27 @@ def render_rays(ray_batch,
     """
     N_rays = ray_batch.shape[0]
     rays_o, rays_d = ray_batch[:,0:3], ray_batch[:,3:6] # [N_rays, 3] each
-    viewdirs = ray_batch[:,-3:] if ray_batch.shape[-1] > 8 else None
-    bounds = torch.reshape(ray_batch[...,6:8], [-1,1,2])
-    near, far = bounds[...,0], bounds[...,1] # [-1,1]
+    viewdirs = ray_batch[:,-3:] if ray_batch.shape[-1] > 8 else None    # [N_rays, 3], 射线的视线方向
+    bounds = torch.reshape(ray_batch[...,6:8], [-1,1,2])    # [N_rays, 1, 2]
+    near, far = bounds[...,0], bounds[...,1] # [N_rays, 1]
 
-    t_vals = torch.linspace(0., 1., steps=N_samples)
-    if not lindisp:
-        z_vals = near * (1.-t_vals) + far * (t_vals)
+    t_vals = torch.linspace(0., 1., steps=N_samples)    # 生成深度采样点, [N_samples]
+    if not lindisp: # 从近平面到远平面之间的深度值，随着t_vals从0变化到1，深度值z_val从near线性变化到far
+        z_vals = near * (1.-t_vals) + far * (t_vals)   # [N_samples]
     else:
         z_vals = 1./(1./near * (1.-t_vals) + 1./far * (t_vals))
 
-    z_vals = z_vals.expand([N_rays, N_samples])
+    z_vals = z_vals.expand([N_rays, N_samples]) # [N_rays, N_samples]
 
-    if perturb > 0.:
+    if perturb > 0.:    # 在给定的深度值(z_vals)之间插入随机扰动，以实现分层采样
         # get intervals between samples
-        mids = .5 * (z_vals[...,1:] + z_vals[...,:-1])
-        upper = torch.cat([mids, z_vals[...,-1:]], -1)
-        lower = torch.cat([z_vals[...,:1], mids], -1)
+        # 计算相邻深度值之间的中点。这是通过取z_vals数组中相邻元素的平均值来完成的
+        mids = .5 * (z_vals[...,1:] + z_vals[...,:-1])  # [N_rays, N_samples-1]
+        # 使用mids来构造每个采样区间的上界和下界。上界由mids和z_vals的最后一个元素组成，下界由z_vals的第一个元素和mids组成。
+        upper = torch.cat([mids, z_vals[...,-1:]], -1)  # [N_rays, N_sample]
+        lower = torch.cat([z_vals[...,:1], mids], -1)   # [N_rays, N_sample]
         # stratified samples in those intervals
+        # 生成一个与z_vals形状相同的随机数数组t_rand，用于在每个区间内进行随机采样
         t_rand = torch.rand(z_vals.shape)
 
         # Pytest, overwrite u with numpy's fixed random numbers
@@ -375,9 +378,9 @@ def render_rays(ray_batch,
             np.random.seed(0)
             t_rand = np.random.rand(*list(z_vals.shape))
             t_rand = torch.Tensor(t_rand)
-
+        # 使用lower、upper和t_rand来计算新的深度值。这是通过在每个区间内根据t_rand的值进行线性插值来实现的
         z_vals = lower + (upper - lower) * t_rand
-
+    # 每个采样值的3D位置，rays_d * z_vals = 每个采样点在射线方向上的位移；再将位移与起点相加得到每个采样值的3D位置
     pts = rays_o[...,None,:] + rays_d[...,None,:] * z_vals[...,:,None] # [N_rays, N_samples, 3]
 
 
@@ -385,11 +388,13 @@ def render_rays(ray_batch,
     raw = network_query_fn(pts, viewdirs, network_fn)
     rgb_map, disp_map, acc_map, weights, depth_map = raw2outputs(raw, z_vals, rays_d, raw_noise_std, white_bkgd, pytest=pytest)
 
-    if N_importance > 0:
+    if N_importance > 0: # 如果N_importance大于0，表示需要进行重要性采样以提高渲染质量。
 
-        rgb_map_0, disp_map_0, acc_map_0 = rgb_map, disp_map, acc_map
-
+        rgb_map_0, disp_map_0, acc_map_0 = rgb_map, disp_map, acc_map   # 保存原始的RGB、视差和累积权重图
+        # 计算中间z值：通过取z_vals数组中相邻元素的平均值来计算中间z值，用于后续的重要性采样
         z_vals_mid = .5 * (z_vals[...,1:] + z_vals[...,:-1])
+        # 执行重要性采样：使用sample_pdf函数根据权重和中间z值进行采样，得到新的z值样本
+        
         z_samples = sample_pdf(z_vals_mid, weights[...,1:-1], N_importance, det=(perturb==0.), pytest=pytest)
         z_samples = z_samples.detach()
 
@@ -612,7 +617,7 @@ def train():
     H, W = int(H), int(W)
     hwf = [H, W, focal]
 
-    if K is None:
+    if K is None:   # K 是内参矩阵
         K = np.array([
             [focal, 0, 0.5*W],
             [0, focal, 0.5*H],
@@ -728,9 +733,9 @@ def train():
         else:
             # Random from one image
             img_i = np.random.choice(i_train)
-            target = images[img_i]
+            target = images[img_i]  # [400, 400, 3]
             target = torch.Tensor(target).to(device)
-            pose = poses[img_i, :3,:4]
+            pose = poses[img_i, :3,:4]  # [3, 4]
 
             if N_rand is not None:
                 rays_o, rays_d = get_rays(H, W, K, torch.Tensor(pose))  # (H, W, 3), (H, W, 3)
