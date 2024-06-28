@@ -395,7 +395,7 @@ def render_rays(ray_batch,
         z_vals_mid = .5 * (z_vals[...,1:] + z_vals[...,:-1])
         # 执行重要性采样：使用sample_pdf函数根据权重和中间z值进行采样，得到新的z值样本
         
-        z_samples = sample_pdf(z_vals_mid, weights[...,1:-1], N_importance, det=(perturb==0.), pytest=pytest)
+        z_samples = sample_pdf(z_vals_mid, weights[...,1:-1], N_importance, det=(perturb==0.), pytest=pytest)   # [N_rays, N_importance]
         z_samples = z_samples.detach()
 
         z_vals, _ = torch.sort(torch.cat([z_vals, z_samples], -1), -1)
